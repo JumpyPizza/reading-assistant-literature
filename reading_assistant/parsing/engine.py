@@ -24,32 +24,50 @@ class ParsingEngine:
 
 class DoclingParsingEngine(ParsingEngine):
     """
-    Docling + RapidOCR based parser. Requires the `docling` package and its
-    dependencies to be installed. It uses docling's `DocumentConverter` API
-    and maps resulting objects to the internal dataclasses.
+    Docling-based parser (with configurable OCR via Docling's PDF pipeline).
+
+    Requires the `docling` package and its dependencies to be installed.
+    Uses Docling's `DocumentConverter` with `PdfPipelineOptions` and maps the
+    resulting DoclingDocument into the internal dataclasses.
     """
 
     def __init__(self, perform_ocr: bool = True, engine_version: str = "docling-latest"):
-        from docling.document_converter import (
-            DocumentConversionParams,
-            DocumentConverter,
-            PdfFormatOption,
-        )
-        from docling.models.docling_models import PageModelType
+        # Docling imports are kept inside __init__ so this module can be imported
+        # without docling installed (e.g. when using DummyParsingEngine only).
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
 
         self.engine_version = engine_version
-        format_options = {
-            ".pdf": PdfFormatOption(
-                perform_ocr=perform_ocr,
-                pdf_page_model=PageModelType.DETECTED_LAYOUT,
-            )
-        }
+
+        # Configure the PDF pipeline according to official Docling usage:
+        #   pipeline_options = PdfPipelineOptions()
+        #   pipeline_options.do_ocr = True/False
+        #   converter = DocumentConverter(
+        #       format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+        #   )
+        # :contentReference[oaicite:1]{index=1}
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = perform_ocr
+
+        # These are generally useful defaults for rich layout understanding.
+        pipeline_options.do_table_structure = True
+        # Avoids a regression if table_structure_options exists (it does in current Docling).
+        if getattr(pipeline_options, "table_structure_options", None) is not None:
+            pipeline_options.table_structure_options.do_cell_matching = True
+
         self.converter = DocumentConverter(
-            conversion_params=DocumentConversionParams(format_options=format_options)
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=pipeline_options,
+                )
+            }
         )
 
     def parse(self, pdf_path: Path) -> ParsedBook:
-        result = self.converter.convert(str(pdf_path))
+        # Docling accepts either a str/Path or URL as "source" and returns a ConversionResult
+        # with a .document attribute (DoclingDocument). :contentReference[oaicite:2]{index=2}
+        result = self.converter.convert(pdf_path)
         doc = result.document
         pages, sections, blocks, assets = self._map_docling_document(doc)
         return ParsedBook(
@@ -76,13 +94,15 @@ class DoclingParsingEngine(ParsingEngine):
         blocks: List[ParsedBlock] = []
         assets: List[ParsedAsset] = []
 
+        # DoclingDocument.pages is a list of PageItem objects with size/page_no. :contentReference[oaicite:3]{index=3}
         raw_pages = getattr(doc, "pages", [])
         for idx, page in enumerate(raw_pages):
-            page_number = getattr(page, "page_number", getattr(page, "number", idx + 1))
+            page_number = getattr(page, "page_number", getattr(page, "page_no", getattr(page, "number", idx + 1)))
             width = getattr(page, "width", getattr(page, "size", [0, 0])[0] if hasattr(page, "size") else 0)
             height = getattr(page, "height", getattr(page, "size", [0, 0])[1] if hasattr(page, "size") else 0)
             pages.append(ParsedPage(page_number=page_number, width=width, height=height))
 
+            # Some pipelines expose layout items as `blocks`, others as `elements`.
             page_blocks = getattr(page, "blocks", None) or getattr(page, "elements", [])
             for block_idx, block in enumerate(page_blocks):
                 bbox = self._coerce_bbox(getattr(block, "bbox", None))
@@ -90,7 +110,7 @@ class DoclingParsingEngine(ParsingEngine):
                 text = getattr(block, "text", getattr(block, "content", ""))
                 markup = getattr(block, "text_representation", None)
                 asset_id = getattr(block, "asset_id", None)
-                section_path = []
+                section_path: List[str] = []
                 blocks.append(
                     ParsedBlock(
                         id=str(getattr(block, "id", f"{page_number}-{block_idx}")),
@@ -107,6 +127,8 @@ class DoclingParsingEngine(ParsingEngine):
                     )
                 )
 
+        # Section/group mapping: if your Docling document exposes a `sections`
+        # attribute, map it; otherwise this will just stay empty.
         raw_sections = getattr(doc, "sections", [])
         for order_idx, section in enumerate(raw_sections):
             sections.append(
@@ -121,6 +143,9 @@ class DoclingParsingEngine(ParsingEngine):
                 )
             )
 
+        # Assets: depending on your Docling version, you may have `assets`,
+        # or you might derive them from `pictures` / `tables`. This keeps the
+        # current behaviour (using `doc.assets` if present).
         raw_assets = getattr(doc, "assets", [])
         for asset in raw_assets:
             bbox = self._coerce_bbox(getattr(asset, "bbox", None))
@@ -140,7 +165,7 @@ class DoclingParsingEngine(ParsingEngine):
     def _coerce_bbox(self, bbox_obj) -> Optional[BBox]:
         if bbox_obj is None:
             return None
-        # Support multiple common bbox shapes from docling or PDF boxes.
+        # Support multiple common bbox shapes from Docling or PDF boxes.
         if hasattr(bbox_obj, "x") and hasattr(bbox_obj, "y") and hasattr(bbox_obj, "w") and hasattr(bbox_obj, "h"):
             return BBox(x=bbox_obj.x, y=bbox_obj.y, w=bbox_obj.w, h=bbox_obj.h)
         if hasattr(bbox_obj, "left") and hasattr(bbox_obj, "top") and hasattr(bbox_obj, "width") and hasattr(bbox_obj, "height"):
@@ -151,56 +176,3 @@ class DoclingParsingEngine(ParsingEngine):
             x0, y0, x1, y1 = bbox_obj
             return BBox(x=x0, y=y0, w=x1 - x0, h=y1 - y0)
         return None
-
-
-class DummyParsingEngine(ParsingEngine):
-    """
-    Minimal stand-in parser for local development.
-
-    It treats each newline-delimited paragraph in a text file as a block on
-    a single synthetic page. This keeps the worker pipeline testable without
-    needing Docling or PDF dependencies.
-    """
-
-    def __init__(self, engine_version: str = "dummy-0.1"):
-        self.engine_version = engine_version
-
-    def parse(self, pdf_path: Path) -> ParsedBook:
-        text = pdf_path.read_text(encoding="utf-8")
-        blocks = []
-        y_cursor = 50.0
-        for idx, paragraph in enumerate([p.strip() for p in text.split("\n") if p.strip()]):
-            block_id = f"blk-{idx}"
-            bbox = BBox(x=50.0, y=y_cursor, w=512.0, h=40.0)
-            blocks.append(
-                ParsedBlock(
-                    id=block_id,
-                    page_number=1,
-                    block_type="paragraph",
-                    text=paragraph,
-                    bbox=bbox,
-                    reading_order=idx,
-                    section_path=[],
-                    markup=None,
-                    asset_id=None,
-                    source_id=block_id,
-                )
-            )
-            y_cursor += 45.0
-        page = ParsedPage(page_number=1, width=612.0, height=792.0)
-        parsed_book = ParsedBook(
-            pages=[page],
-            sections=[],
-            blocks=blocks,
-            assets=[],
-            engine_version=self.engine_version,
-            metadata={"source": "dummy_text"},
-        )
-        return parsed_book
-
-    def count_pages(self, pdf_path: Path) -> Optional[int]:
-        return 1
-
-
-def generate_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:8]}"
