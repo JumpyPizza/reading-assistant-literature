@@ -70,7 +70,7 @@ class DoclingParsingEngine(ParsingEngine):
         except Exception:
             return None
 
-    def _map_docling_document(self, doc) -> (List[ParsedPage], List[ParsedSection], List[ParsedBlock], List[ParsedAsset]):
+    def _map_docling_document(self, doc):
         pages: List[ParsedPage] = []
         sections: List[ParsedSection] = []
         blocks: List[ParsedBlock] = []

@@ -1,0 +1,7 @@
+docling
+pypdf
+sqlalchemy
+whoosh
+redis
+rq
+pytest
