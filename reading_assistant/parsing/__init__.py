@@ -2,7 +2,7 @@
 Parsing subsystem exports.
 """
 
-from .engine import ParsingEngine, DoclingParsingEngine, DummyParsingEngine
+from .engine import ParsingEngine, DoclingParsingEngine
 from .indexing import Indexer, NoopIndexer, WhooshIndexer
 from .job_queue import RQJobQueue, WorkerConfig, run_parse_job
 from .models import (
@@ -26,7 +26,6 @@ __all__ = [
     "BookRecord",
     "BookStatus",
     "DoclingParsingEngine",
-    "DummyParsingEngine",
     "Indexer",
     "InMemoryParsingRepository",
     "LocalBookStorage",
@@ -45,4 +44,5 @@ __all__ = [
     "run_parse_job",
     "SectionRecord",
     "StoragePaths",
+    "ParsingRepository",
 ]

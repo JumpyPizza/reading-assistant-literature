@@ -168,6 +168,12 @@ class ParsingRepository:
     def list_blocks_for_book(self, book_id: str) -> List[BlockRecord]:
         raise NotImplementedError
 
+    def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
+        raise NotImplementedError
+
+    def get_page(self, book_id: str, page_number: int) -> Optional[PageRecord]:
+        raise NotImplementedError
+
 
 class InMemoryParsingRepository(ParsingRepository):
     """
@@ -196,7 +202,7 @@ class InMemoryParsingRepository(ParsingRepository):
     def update_book_status(self, book_id: str, status: BookStatus, page_count: Optional[int] = None) -> None:
         book = self.books.get(book_id)
         if not book:
-            return
+            raise KeyError(f"Book not found: {book_id}")
         book.status = status
         if page_count is not None:
             book.page_count = page_count
@@ -220,7 +226,7 @@ class InMemoryParsingRepository(ParsingRepository):
     ) -> None:
         job = self.jobs.get(job_id)
         if not job:
-            return
+            raise KeyError(f"Parse job not found: {job_id}")
         if state is not None:
             job.state = state
         if phase is not None:
@@ -251,6 +257,25 @@ class InMemoryParsingRepository(ParsingRepository):
 
     def list_blocks_for_book(self, book_id: str) -> List[BlockRecord]:
         return [self._clone(b) for b in self.blocks.values() if b.book_id == book_id]
+
+    def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
+        page = self.get_page(book_id, page_number)
+        if not page:
+            raise KeyError(f"Page not found: {book_id} page {page_number}")
+        blocks = [
+            self._clone(b)
+            for b in self.blocks.values()
+            if b.book_id == book_id and b.page_id == page.id
+        ]
+        if not blocks:
+            raise ValueError(f"No blocks found for {book_id} page {page_number}")
+        return sorted(blocks, key=lambda b: b.reading_order)
+
+    def get_page(self, book_id: str, page_number: int) -> Optional[PageRecord]:
+        for page in self.pages.values():
+            if page.book_id == book_id and page.page_number == page_number:
+                return self._clone(page)
+        return None
 
 
 class SqlAlchemyParsingRepository(ParsingRepository):
@@ -313,8 +338,10 @@ class SqlAlchemyParsingRepository(ParsingRepository):
             stmt = update(BookModel).where(BookModel.id == book_id).values(status=status)
             if page_count is not None:
                 stmt = stmt.values(page_count=page_count)
-            session.execute(stmt)
+            result = session.execute(stmt)
             session.commit()
+            if result.rowcount == 0:
+                raise ValueError(f"Book not found: {book_id}")
 
     # endregion
 
@@ -377,8 +404,10 @@ class SqlAlchemyParsingRepository(ParsingRepository):
             if error_message is not None:
                 values["error_message"] = error_message
             if values:
-                session.execute(stmt.values(**values))
+                result = session.execute(stmt.values(**values))
                 session.commit()
+                if result.rowcount == 0:
+                    raise ValueError(f"Parse job not found: {job_id}")
 
     # endregion
 
@@ -488,5 +517,55 @@ class SqlAlchemyParsingRepository(ParsingRepository):
                 )
                 for m in models
             ]
+
+    def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
+        page = self.get_page(book_id, page_number)
+        if not page:
+            raise ValueError(f"Page not found: {book_id} page {page_number}")
+        with self._session() as session:
+            stmt = select(BlockModel).where(BlockModel.book_id == book_id, BlockModel.page_id == page.id)
+            models = session.execute(stmt).scalars().all()
+            if not models:
+                raise ValueError(f"No blocks found for {book_id} page {page_number}")
+            return [
+                BlockRecord(
+                    id=m.id,
+                    book_id=m.book_id,
+                    page_id=m.page_id,
+                    section_id=m.section_id,
+                    block_type=m.block_type,
+                    text=m.text,
+                    markup=m.markup,
+                    bbox_x=m.bbox_x,
+                    bbox_y=m.bbox_y,
+                    bbox_w=m.bbox_w,
+                    bbox_h=m.bbox_h,
+                    reading_order=int(m.reading_order or 0),
+                    asset_id=m.asset_id,
+                    source_id=m.source_id,
+                    created_at=m.created_at,
+                    updated_at=m.updated_at,
+                )
+                for m in models
+            ]
+
+    def get_page(self, book_id: str, page_number: int) -> Optional[PageRecord]:
+        with self._session() as session:
+            stmt = select(PageModel).where(PageModel.book_id == book_id, PageModel.page_number == page_number)
+            model = session.execute(stmt).scalar_one_or_none()
+            if not model:
+                return None
+            return PageRecord(
+                id=model.id,
+                book_id=model.book_id,
+                page_number=int(model.page_number),
+                width=model.width,
+                height=model.height,
+                render_image_path=model.render_image_path,
+                thumbnail_image_path=model.thumbnail_image_path,
+                parse_status=model.parse_status,
+                created_at=model.created_at,
+                updated_at=model.updated_at,
+            )
 
     # endregion

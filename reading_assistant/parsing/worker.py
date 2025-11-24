@@ -38,6 +38,7 @@ class ParsingWorker:
         indexer: Indexer,
         batch_size: int = 50,
         persist_engine_output: bool = True,
+        render_page_previews: bool = True,
     ):
         self.repo = repository
         self.storage = storage
@@ -45,6 +46,7 @@ class ParsingWorker:
         self.indexer = indexer
         self.batch_size = batch_size
         self.persist_engine_output = persist_engine_output
+        self.render_page_previews = render_page_previews
 
     def run_job(self, job_id: str) -> None:
         job = self.repo.get_job(job_id)
@@ -60,8 +62,18 @@ class ParsingWorker:
             self.repo.update_book_status(book.id, BookStatus.PARSING)
 
             page_count = self._determine_page_count(pdf_path)
+            if page_count is None:
+                raise ValueError(f"Failed to determine page count for {pdf_path}")
             self.repo.update_book_status(book.id, BookStatus.PARSING, page_count=page_count)
             self.repo.update_job_state_phase(job_id, total_pages=page_count)
+
+            page_artifacts = None
+            if self.render_page_previews:
+                page_artifacts = self.storage.render_pdf_pages(book.id, pdf_path)
+                if len(page_artifacts) != page_count:
+                    raise RuntimeError(
+                        f"Rendered page artifacts mismatch: expected {page_count}, got {len(page_artifacts)}"
+                    )
 
             self.repo.update_job_state_phase(job_id, phase=ParseJobPhase.DOCLING_PARSE)
             parsed_book = self.engine.parse(pdf_path)
@@ -70,7 +82,13 @@ class ParsingWorker:
                 self.storage.write_docling_output(book.id, json.loads(json.dumps(parsed_book, default=self._json_default)))
 
             self.repo.update_job_state_phase(job_id, phase=ParseJobPhase.DB_INGESTION)
-            self._ingest_parsed_book(job_id, book.id, parsed_book, resume_from_page=job.current_page)
+            self._ingest_parsed_book(
+                job_id,
+                book.id,
+                parsed_book,
+                resume_from_page=job.current_page,
+                page_artifacts=page_artifacts,
+            )
 
             self.repo.update_job_state_phase(job_id, phase=ParseJobPhase.INDEXING)
             blocks = self.repo.list_blocks_for_book(book.id)
@@ -105,6 +123,7 @@ class ParsingWorker:
         book_id: str,
         parsed_book: ParsedBook,
         resume_from_page: int = 0,
+        page_artifacts: Optional[Dict[int, Dict[str, Path]]] = None,
     ) -> None:
         pages_sorted = sorted(parsed_book.pages, key=lambda p: p.page_number)
         sections_sorted = sorted(parsed_book.sections, key=lambda s: s.order_index if hasattr(s, "order_index") else 0)
@@ -126,14 +145,17 @@ class ParsingWorker:
                 continue
             page_id = f"{book_id}-p{page.page_number}"
             page_id_map[page.page_number] = page_id
+            artifacts = page_artifacts.get(page.page_number) if page_artifacts is not None else None
+            if page_artifacts is not None and (artifacts is None or not artifacts.get("image")):
+                raise RuntimeError(f"Missing rendered page image for book {book_id} page {page.page_number}")
             page_record = PageRecord(
                 id=page_id,
                 book_id=book_id,
                 page_number=page.page_number,
                 width=page.width,
                 height=page.height,
-                render_image_path=None,
-                thumbnail_image_path=None,
+                render_image_path=str(artifacts.get("image")) if artifacts and artifacts.get("image") else None,
+                thumbnail_image_path=str(artifacts.get("thumbnail")) if artifacts and artifacts.get("thumbnail") else None,
                 parse_status="parsed",
             )
             batch_pages.append(page_record)

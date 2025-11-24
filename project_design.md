@@ -110,7 +110,10 @@ It does the following:
     These APIs define how our reader retrieves parsed book and render it; basically it defines how the parsed data is exchanged 
 
 #### Reader 
-TO Be added 
+A browser-based, front-end reader, that:
+shows the original pdf (one page) at the left side;
+shows the rephrased content of this page at the right side;
+
 
 #### RAG 
 TO Be added 

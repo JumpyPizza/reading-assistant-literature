@@ -22,6 +22,7 @@ class WorkerConfig:
     engine_version: str = "docling-latest"
     batch_size: int = 50
     persist_engine_output: bool = False
+    render_page_previews: bool = True
 
 
 def run_parse_job(job_id: str, config: WorkerConfig) -> None:
@@ -39,6 +40,7 @@ def run_parse_job(job_id: str, config: WorkerConfig) -> None:
         indexer=indexer,
         batch_size=config.batch_size,
         persist_engine_output=config.persist_engine_output,
+        render_page_previews=config.render_page_previews,
     )
     worker.run_job(job_id)
 

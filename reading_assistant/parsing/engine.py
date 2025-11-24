@@ -3,9 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 import uuid
+from io import BytesIO
 
 from .models import BBox, ParsedAsset, ParsedBlock, ParsedBook, ParsedPage, ParsedSection
 
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+from docling.datamodel.accelerator_options import (
+            AcceleratorOptions,
+            AcceleratorDevice,
+        )
+from docling_core.types.doc.document import TextItem, TableItem, PictureItem, SectionHeaderItem
+from docling_core.types.doc import BoundingBox as DlBBox
 
 class ParsingEngine:
     """
@@ -21,6 +31,10 @@ class ParsingEngine:
         """
         return None
 
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 class DoclingParsingEngine(ParsingEngine):
     """
@@ -30,32 +44,30 @@ class DoclingParsingEngine(ParsingEngine):
     Uses Docling's `DocumentConverter` with `PdfPipelineOptions` and maps the
     resulting DoclingDocument into the internal dataclasses.
     """
-
+    #  backend=PyPdfiumDocumentBackend 
+    # known bug: default backend failed to parse some pdfs with non-standard size #2536
     def __init__(self, perform_ocr: bool = True, engine_version: str = "docling-latest"):
-        # Docling imports are kept inside __init__ so this module can be imported
-        # without docling installed (e.g. when using DummyParsingEngine only).
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        
+        
+        accelerator_options = AcceleratorOptions(
+            num_threads=8, device=AcceleratorDevice.AUTO
+        )
 
         self.engine_version = engine_version
 
-        # Configure the PDF pipeline according to official Docling usage:
-        #   pipeline_options = PdfPipelineOptions()
-        #   pipeline_options.do_ocr = True/False
-        #   converter = DocumentConverter(
-        #       format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-        #   )
-        # :contentReference[oaicite:1]{index=1}
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = perform_ocr
 
         # These are generally useful defaults for rich layout understanding.
         pipeline_options.do_table_structure = True
-        # Avoids a regression if table_structure_options exists (it does in current Docling).
-        if getattr(pipeline_options, "table_structure_options", None) is not None:
-            pipeline_options.table_structure_options.do_cell_matching = True
-
+        pipeline_options.generate_picture_images = True
+        pipeline_options.generate_page_images = True
+        pipeline_options.images_scale = 2.0
+        # use rapidocr 
+        pipeline_options.ocr_options = RapidOcrOptions()
+        pipeline_options.accelerator_options  = accelerator_options
+        
+        
         self.converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
@@ -65,11 +77,17 @@ class DoclingParsingEngine(ParsingEngine):
         )
 
     def parse(self, pdf_path: Path) -> ParsedBook:
-        # Docling accepts either a str/Path or URL as "source" and returns a ConversionResult
-        # with a .document attribute (DoclingDocument). :contentReference[oaicite:2]{index=2}
-        result = self.converter.convert(pdf_path)
-        doc = result.document
+        try:
+            result = self.converter.convert(pdf_path)
+        
+            doc = result.document
+        except Exception:
+            raise RuntimeError("parsing failed")
+ 
+
+        
         pages, sections, blocks, assets = self._map_docling_document(doc)
+      
         return ParsedBook(
             pages=pages,
             sections=sections,
@@ -89,83 +107,135 @@ class DoclingParsingEngine(ParsingEngine):
             return None
 
     def _map_docling_document(self, doc):
-        pages: List[ParsedPage] = []
-        sections: List[ParsedSection] = []
-        blocks: List[ParsedBlock] = []
-        assets: List[ParsedAsset] = []
+        generated_ids = {}
 
-        # DoclingDocument.pages is a list of PageItem objects with size/page_no. :contentReference[oaicite:3]{index=3}
-        raw_pages = getattr(doc, "pages", [])
-        for idx, page in enumerate(raw_pages):
-            page_number = getattr(page, "page_number", getattr(page, "page_no", getattr(page, "number", idx + 1)))
-            width = getattr(page, "width", getattr(page, "size", [0, 0])[0] if hasattr(page, "size") else 0)
-            height = getattr(page, "height", getattr(page, "size", [0, 0])[1] if hasattr(page, "size") else 0)
-            pages.append(ParsedPage(page_number=page_number, width=width, height=height))
+        def ensure_id(obj):
+            obj_id = getattr(obj, "id", None)
+            if obj_id:
+                return str(obj_id)
+            key = id(obj)
+            if key not in generated_ids:
+                generated_ids[key] = str(uuid.uuid4())
+            return generated_ids[key]
 
-            # Some pipelines expose layout items as `blocks`, others as `elements`.
-            page_blocks = getattr(page, "blocks", None) or getattr(page, "elements", [])
-            for block_idx, block in enumerate(page_blocks):
-                bbox = self._coerce_bbox(getattr(block, "bbox", None))
-                block_type = getattr(block, "category", getattr(block, "type", "paragraph"))
-                text = getattr(block, "text", getattr(block, "content", ""))
-                markup = getattr(block, "text_representation", None)
-                asset_id = getattr(block, "asset_id", None)
-                section_path: List[str] = []
-                blocks.append(
-                    ParsedBlock(
-                        id=str(getattr(block, "id", f"{page_number}-{block_idx}")),
-                        page_number=page_number,
-                        block_type=str(block_type),
-                        text=text,
-                        markup=markup,
-                        bbox=bbox or BBox(0, 0, 0, 0),
-                        reading_order=getattr(block, "reading_order", block_idx),
-                        section_path=section_path,
-                        asset_id=str(asset_id) if asset_id else None,
-                        source_id=str(getattr(block, "id", None)),
-                        metadata=getattr(block, "metadata", {}),
+        pages = []
+        page_heights = {}
+        for page_no, page in doc.pages.items():            # 1-based keys
+            size = page.size or type("S",(object,),{"width":0,"height":0})()
+            page_heights[page_no] = getattr(size, "height", None)
+            pages.append(ParsedPage(page_number=page_no, width=size.width, height=size.height))
+
+        blocks = []
+        for item, level in doc.iterate_items(traverse_pictures=True):
+            prov = item.prov[0] if getattr(item, "prov", []) else None
+            if not prov or prov.page_no is None or prov.bbox is None:
+                continue  # drop incomplete provenance to avoid None downstream
+            page_height = page_heights.get(prov.page_no)
+            bbox = self._coerce_bbox(prov.bbox, page_height=page_height)
+            if bbox is None:
+                continue
+            text = getattr(item, "text", "")
+            label = getattr(item, "label", "text")
+            item_id = ensure_id(item)
+            asset_id = item_id if isinstance(item, (PictureItem, TableItem)) else None
+            blocks.append(
+                ParsedBlock(
+                    id=item_id,
+                    page_number=prov.page_no,
+                    block_type=str(label),
+                    text=text,
+                    markup=None,
+                    bbox=bbox,
+                    reading_order=len(blocks),           # iterate_items is in reading order
+                    section_path=[],
+                    asset_id=asset_id,
+                    source_id=item_id,
+                    metadata=getattr(item, "metadata", {}),
+                )
+            )
+
+        sections = []
+        order = 0
+        for item, level in doc.iterate_items():
+            if isinstance(item, SectionHeaderItem):
+                prov = item.prov[0] if item.prov else None
+                if not prov or prov.page_no is None:
+                    continue
+                sections.append(
+                    ParsedSection(
+                        id=str(getattr(item, "id", order)),
+                        parent_id=None,                  # derive from body tree if needed
+                        level=level,                     # tree depth
+                        title_text=item.text,
+                        start_page_number=prov.page_no,
+                        end_page_number=prov.page_no,
+                        order_index=order,
                     )
                 )
+                order += 1
 
-        # Section/group mapping: if your Docling document exposes a `sections`
-        # attribute, map it; otherwise this will just stay empty.
-        raw_sections = getattr(doc, "sections", [])
-        for order_idx, section in enumerate(raw_sections):
-            sections.append(
-                ParsedSection(
-                    id=str(getattr(section, "id", order_idx)),
-                    parent_id=getattr(section, "parent_id", None),
-                    level=getattr(section, "level", 1),
-                    title_text=getattr(section, "title", getattr(section, "title_text", "")),
-                    start_page_number=getattr(section, "start_page", getattr(section, "start_page_number", 1)),
-                    end_page_number=getattr(section, "end_page", getattr(section, "end_page_number", 1)),
-                    order_index=order_idx,
-                )
-            )
+        assets = []
+        for pic in doc.pictures:
+            prov = pic.prov[0] if pic.prov else None
+            if not prov or prov.page_no is None or prov.bbox is None:
+                continue
+            page_height = page_heights.get(prov.page_no)
+            bbox = self._coerce_bbox(prov.bbox, page_height=page_height)
+            if bbox is None:
+                continue
+            img = pic.get_image(doc)  # PIL.Image or None if images weren’t generated
+            asset_id = ensure_id(pic)
+            image_bytes = self._image_to_png_bytes(img)
 
-        # Assets: depending on your Docling version, you may have `assets`,
-        # or you might derive them from `pictures` / `tables`. This keeps the
-        # current behaviour (using `doc.assets` if present).
-        raw_assets = getattr(doc, "assets", [])
-        for asset in raw_assets:
-            bbox = self._coerce_bbox(getattr(asset, "bbox", None))
             assets.append(
                 ParsedAsset(
-                    id=str(getattr(asset, "id", "")),
-                    page_number=getattr(asset, "page_number", 1),
-                    asset_type=str(getattr(asset, "type", getattr(asset, "asset_type", "figure"))),
-                    bbox=bbox or BBox(0, 0, 0, 0),
-                    image_bytes=getattr(asset, "image_bytes", None),
-                    image_path=getattr(asset, "image_path", None),
-                    metadata=getattr(asset, "metadata", {}),
+                    id=asset_id,
+                    page_number=prov.page_no,
+                    asset_type="picture",
+                    bbox=bbox,
+                    image_bytes=image_bytes,
+                    image_path=None,
+                    metadata=getattr(pic, "metadata", {}),
                 )
             )
+        for table in doc.tables:
+            prov = table.prov[0] if table.prov else None
+            if not prov or prov.page_no is None or prov.bbox is None:
+                continue
+            page_height = page_heights.get(prov.page_no)
+            bbox = self._coerce_bbox(prov.bbox, page_height=page_height)
+            if bbox is None:
+                continue
+            img = table.get_image(doc)
+            asset_id = ensure_id(table)
+            image_bytes = self._image_to_png_bytes(img)
+            assets.append(
+                ParsedAsset(
+                    id=asset_id,
+                    page_number=prov.page_no,
+                    asset_type="table",
+                    bbox=bbox,
+                    image_bytes=image_bytes,
+                    image_path=None,
+                    metadata=getattr(table, "metadata", {}),
+                )
+            )
+
         return pages, sections, blocks, assets
 
-    def _coerce_bbox(self, bbox_obj) -> Optional[BBox]:
+    def _coerce_bbox(self, bbox_obj, page_height: float | None = None) -> Optional[BBox]:
         if bbox_obj is None:
             return None
-        # Support multiple common bbox shapes from Docling or PDF boxes.
+
+        # Docling native BoundingBox
+        if isinstance(bbox_obj, DlBBox):
+            bb = bbox_obj
+            # convert to top-left if caller provides page height and origin is bottom-left
+            if page_height is not None and bb.coord_origin.name == "BOTTOMLEFT":
+                bb = bb.to_top_left_origin(page_height=page_height)
+            return BBox(x=bb.l, y=bb.t, w=bb.width, h=bb.height)
+
+        # Already top-left/width/height style
         if hasattr(bbox_obj, "x") and hasattr(bbox_obj, "y") and hasattr(bbox_obj, "w") and hasattr(bbox_obj, "h"):
             return BBox(x=bbox_obj.x, y=bbox_obj.y, w=bbox_obj.w, h=bbox_obj.h)
         if hasattr(bbox_obj, "left") and hasattr(bbox_obj, "top") and hasattr(bbox_obj, "width") and hasattr(bbox_obj, "height"):
@@ -176,3 +246,17 @@ class DoclingParsingEngine(ParsingEngine):
             x0, y0, x1, y1 = bbox_obj
             return BBox(x=x0, y=y0, w=x1 - x0, h=y1 - y0)
         return None
+
+
+    def _image_to_png_bytes(self, image) -> Optional[bytes]:
+        if image is None:
+            return None
+        buffer = BytesIO()
+        try:
+            image.save(buffer, format="PNG")
+        except Exception:
+            return None
+        return buffer.getvalue()
+
+
+# TODO: save pages' images 

@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -33,12 +34,29 @@ def compute_md5(path: Path) -> str:
     return digest.hexdigest()
 
 
+def build_book_id(title: str) -> str:
+    """
+    Build a deterministic, unique-ish book id from the title.
+    Example: "My Book" -> "my-book-1a2b3c4d".
+    """
+    normalized = title.strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    if not slug:
+        slug = "book"
+    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pdf", required=True, type=Path, help="Path to input PDF")
     parser.add_argument("--title", required=True, help="Book title")
     parser.add_argument("--author", default=None, help="Book author")
-    parser.add_argument("--book-id", default="book-demo", help="Book id (for DB/paths)")
+    parser.add_argument(
+        "--book-id",
+        default=None,
+        help="Book id (for DB/paths); if omitted a deterministic id is derived from the title",
+    )
     parser.add_argument("--db", default=Path("./data/reading_assistant.db"), type=Path, help="SQLite DB path")
     parser.add_argument("--storage-root", default=Path("./data"), type=Path, help="Storage root for books/assets")
     parser.add_argument("--whoosh-dir", default=Path("./data/whoosh"), type=Path, help="Whoosh index directory")
@@ -49,13 +67,16 @@ def main():
     if not args.pdf.exists():
         raise FileNotFoundError(f"PDF not found: {args.pdf}")
 
+    book_id = args.book_id or build_book_id(args.title)
+
     storage = LocalBookStorage(StoragePaths(args.storage_root))
-    storage.ensure_base_dirs(args.book_id)
-    original_pdf_path = storage.save_original_pdf(args.book_id, args.pdf)
+    storage.ensure_base_dirs(book_id)
+    original_pdf_path = storage.save_original_pdf(book_id, args.pdf)
 
     repo = SqlAlchemyParsingRepository(f"sqlite+pysqlite:///{args.db}")
     indexer = WhooshIndexer(args.whoosh_dir)
     engine = DoclingParsingEngine(perform_ocr=args.perform_ocr)
+    print("establishing worker")
     worker = ParsingWorker(
         repository=repo,
         storage=storage,
@@ -66,7 +87,7 @@ def main():
     )
 
     book = BookRecord(
-        id=args.book_id,
+        id=book_id,
         user_id="local-user",
         file_md5=compute_md5(args.pdf),
         title=args.title,
@@ -80,11 +101,11 @@ def main():
         updated_at=datetime.utcnow(),
     )
     repo.save_book(book)
-
-    job_id = f"job-{args.book_id}"
+    print("prepare job")
+    job_id = f"job-{book_id}"
     job = ParseJobRecord(
         id=job_id,
-        book_id=args.book_id,
+        book_id=book_id,
         state=ParseJobState.QUEUED,
         phase=ParseJobPhase.PRECHECK,
         current_page=0,

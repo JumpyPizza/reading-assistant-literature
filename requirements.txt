@@ -1,7 +1,12 @@
 docling
+docling-core
 pypdf
 sqlalchemy
 whoosh
 redis
 rq
 pytest
+pymupdf
+fastapi
+uvicorn
+python-multipart

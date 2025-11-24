@@ -121,6 +121,7 @@ def test_worker_ingests_dummy_engine(tmp_path):
         indexer=indexer,
         batch_size=10,
         persist_engine_output=True,
+        render_page_previews=False,  # skip PDF rendering in dummy test
     )
 
     sample_pdf = tmp_path / "sample.txt"
