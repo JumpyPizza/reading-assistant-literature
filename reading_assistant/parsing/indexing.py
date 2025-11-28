@@ -59,8 +59,28 @@ class WhooshIndexer:
             )
         writer.commit()
 
+    def delete_book(self, book_id: str) -> None:
+        writer = self.ix.writer()
+        writer.delete_by_term("book_id", book_id)
+        writer.commit()
+
     def search(self, query_str: str, limit: int = 10):
+        """
+        Return a list of plain dicts so callers are safe after the searcher closes.
+        """
         qp = QueryParser("text", schema=self.schema)
         q = qp.parse(query_str)
         with self.ix.searcher() as searcher:
-            return list(searcher.search(q, limit=limit))
+            results = searcher.search(q, limit=limit)
+            hits = []
+            for hit in results:
+                fields = hit.fields()
+                hits.append(
+                    {
+                        "block_id": fields.get("block_id"),
+                        "page_id": fields.get("page_id"),
+                        "reading_order": fields.get("reading_order"),
+                        "text": fields.get("text"),
+                    }
+                )
+            return hits

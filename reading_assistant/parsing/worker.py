@@ -55,6 +55,8 @@ class ParsingWorker:
         book = self.repo.get_book(job.book_id)
         if not book:
             raise ValueError(f"Book {job.book_id} not found for job {job_id}")
+        if self._should_stop(job_id):
+            return
 
         pdf_path = self._locate_pdf(book.original_file_path, book.id)
         try:
@@ -76,7 +78,11 @@ class ParsingWorker:
                     )
 
             self.repo.update_job_state_phase(job_id, phase=ParseJobPhase.DOCLING_PARSE)
+            if self._should_stop(job_id):
+                return
             parsed_book = self.engine.parse(pdf_path)
+            if self._should_stop(job_id):
+                return
 
             if self.persist_engine_output:
                 self.storage.write_docling_output(book.id, json.loads(json.dumps(parsed_book, default=self._json_default)))
@@ -89,10 +95,14 @@ class ParsingWorker:
                 resume_from_page=job.current_page,
                 page_artifacts=page_artifacts,
             )
+            if self._should_stop(job_id):
+                return
 
             self.repo.update_job_state_phase(job_id, phase=ParseJobPhase.INDEXING)
             blocks = self.repo.list_blocks_for_book(book.id)
             self.indexer.index_book(book.id, blocks)
+            if self._should_stop(job_id):
+                return
 
             self.repo.update_job_state_phase(job_id, state=ParseJobState.COMPLETED)
             self.repo.update_book_status(book.id, BookStatus.PARSED)
@@ -173,30 +183,21 @@ class ParsingWorker:
             asset_records = self._map_assets(book_id, page_id, related_assets, asset_owner_map)
             batch_assets.extend(asset_records)
 
-            # Commit batch when reaching batch_size or end.
-            if len(batch_pages) >= self.batch_size:
-                self.repo.upsert_pages(batch_pages)
-                self.repo.upsert_blocks(batch_blocks)
-                self.repo.upsert_assets(batch_assets)
-                last_page_ingested = page.page_number
-                self.repo.update_job_state_phase(job_id, current_page=last_page_ingested)
-                batch_pages, batch_blocks, batch_assets = [], [], []
-                if self._should_pause(job_id):
-                    return
-
-        # Final flush
-        if batch_pages:
+            # Commit per page to keep progress current and avoid stale 0/N.
             self.repo.upsert_pages(batch_pages)
             self.repo.upsert_blocks(batch_blocks)
             self.repo.upsert_assets(batch_assets)
-            last_page_ingested = batch_pages[-1].page_number
+            last_page_ingested = page.page_number
             self.repo.update_job_state_phase(job_id, current_page=last_page_ingested)
-            if self._should_pause(job_id):
+            batch_pages, batch_blocks, batch_assets = [], [], []
+            if self._should_stop(job_id):
                 return
 
-    def _should_pause(self, job_id: str) -> bool:
+        # No-op: batches are flushed per page above.
+
+    def _should_stop(self, job_id: str) -> bool:
         job = self.repo.get_job(job_id)
-        return bool(job and job.state == ParseJobState.PAUSED)
+        return bool(job and job.state in {ParseJobState.PAUSED, ParseJobState.FAILED})
 
     def _map_sections(
         self,

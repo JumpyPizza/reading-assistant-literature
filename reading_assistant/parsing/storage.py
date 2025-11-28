@@ -78,6 +78,12 @@ class LocalBookStorage:
         path = self.paths.original_pdf_path(book_id)
         return path if path.exists() else None
 
+    def delete_book(self, book_id: str) -> None:
+        """Remove all stored artifacts for a book."""
+        base = self.paths.book_dir(book_id)
+        if base.exists():
+            shutil.rmtree(base, ignore_errors=True)
+
     def render_pdf_pages(
         self,
         book_id: str,

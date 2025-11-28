@@ -168,10 +168,16 @@ class ParsingRepository:
     def list_blocks_for_book(self, book_id: str) -> List[BlockRecord]:
         raise NotImplementedError
 
+    def delete_book(self, book_id: str) -> None:
+        raise NotImplementedError
+
     def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
         raise NotImplementedError
 
     def get_page(self, book_id: str, page_number: int) -> Optional[PageRecord]:
+        raise NotImplementedError
+
+    def list_books(self) -> List[BookRecord]:
         raise NotImplementedError
 
 
@@ -258,6 +264,14 @@ class InMemoryParsingRepository(ParsingRepository):
     def list_blocks_for_book(self, book_id: str) -> List[BlockRecord]:
         return [self._clone(b) for b in self.blocks.values() if b.book_id == book_id]
 
+    def delete_book(self, book_id: str) -> None:
+        self.books.pop(book_id, None)
+        self.jobs = {k: v for k, v in self.jobs.items() if v.book_id != book_id}
+        self.pages = {k: v for k, v in self.pages.items() if v.book_id != book_id}
+        self.sections = {k: v for k, v in self.sections.items() if v.book_id != book_id}
+        self.blocks = {k: v for k, v in self.blocks.items() if v.book_id != book_id}
+        self.assets = {k: v for k, v in self.assets.items() if v.book_id != book_id}
+
     def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
         page = self.get_page(book_id, page_number)
         if not page:
@@ -276,6 +290,9 @@ class InMemoryParsingRepository(ParsingRepository):
             if page.book_id == book_id and page.page_number == page_number:
                 return self._clone(page)
         return None
+
+    def list_books(self) -> List[BookRecord]:
+        return [self._clone(b) for b in self.books.values()]
 
 
 class SqlAlchemyParsingRepository(ParsingRepository):
@@ -518,6 +535,18 @@ class SqlAlchemyParsingRepository(ParsingRepository):
                 for m in models
             ]
 
+    def delete_book(self, book_id: str) -> None:
+        from sqlalchemy import delete
+
+        with self._session() as session:
+            session.execute(delete(AssetModel).where(AssetModel.book_id == book_id))
+            session.execute(delete(BlockModel).where(BlockModel.book_id == book_id))
+            session.execute(delete(PageModel).where(PageModel.book_id == book_id))
+            session.execute(delete(SectionModel).where(SectionModel.book_id == book_id))
+            session.execute(delete(ParseJobModel).where(ParseJobModel.book_id == book_id))
+            session.execute(delete(BookModel).where(BookModel.id == book_id))
+            session.commit()
+
     def list_blocks_for_page(self, book_id: str, page_number: int) -> List[BlockRecord]:
         page = self.get_page(book_id, page_number)
         if not page:
@@ -567,5 +596,27 @@ class SqlAlchemyParsingRepository(ParsingRepository):
                 created_at=model.created_at,
                 updated_at=model.updated_at,
             )
+
+    def list_books(self) -> List[BookRecord]:
+        with self._session() as session:
+            models = session.execute(select(BookModel)).scalars().all()
+            return [
+                BookRecord(
+                    id=m.id,
+                    user_id=m.user_id,
+                    file_md5=m.file_md5,
+                    title=m.title,
+                    author=m.author,
+                    source=m.source,
+                    original_file_path=m.original_file_path,
+                    language=m.language,
+                    parse_version=m.parse_version,
+                    status=m.status,
+                    page_count=m.page_count,
+                    created_at=m.created_at,
+                    updated_at=m.updated_at,
+                )
+                for m in models
+            ]
 
     # endregion

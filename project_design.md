@@ -114,7 +114,8 @@ A browser-based, front-end reader, that:
 shows the original pdf (one page) at the left side;
 shows the rephrased content of this page at the right side;
 
-
+Note function: (implemented later)
+Select some texts, a note box pop out; can write some notes about the selected texts; then, there is a export function, that export the notes and the texts on to notion. 
 #### RAG 
 TO Be added 
 
